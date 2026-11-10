@@ -1,0 +1,258 @@
+# ==========================================
+# FULL ANALYSIS SCRIPT (FINAL ROBUST VERSION)
+# ==========================================
+!pip install -q -U   pandas openpyxl tqdm
+
+import os
+import time
+import pandas as pd
+import io
+import google.generativeai as genai
+from google.colab import drive
+from google.api_core.exceptions import ResourceExhausted, InternalServerError, DeadlineExceeded
+from requests.exceptions import ReadTimeout
+from tqdm.notebook import tqdm
+
+# 1. MOUNT DRIVE
+# NOTE: You MUST interact with the pop-up/link in the Colab output to authorize this.
+print("--- MOUNTING GOOGLE DRIVE ---")
+drive.mount('/content/drive')
+
+# ==========================================
+# 2. CONFIGURATION
+# ==========================================
+# PASTE YOUR REAL API KEY HERE:
+GOOGLE_API_KEY = '***'
+
+# PATH (Confirmed working)
+folder_path = "***"
+
+# SETTINGS
+MODEL_ID = 'gemini-2.5-flash'
+API_TIMEOUT_SECONDS = 180  # Max timeout for the complex analysis call
+DELAY_PER_FILE = 4          # Wait 4s between files
+DELAY_ON_ERROR = 60         # Wait 60s if we hit a limit or server issue
+RETRY_ATTEMPTS = 3
+
+# OUTPUT FILES (Saved to your Drive)
+CHECKPOINT_FILE = "/content/drive/MyDrive/Dutch_Letters2_Checkpoint2.xlsx"
+FINAL_FILE = "/content/drive/MyDrive/Dutch_Letters2_Final2.xlsx"
+
+# ==========================================
+# 3. PROMPT TEMPLATES & SETUP
+# ==========================================
+print("\n--- API SETUP ---")
+
+if GOOGLE_API_KEY == 'YOUR_API_KEY':
+    # Replace the placeholder key check with a more robust check if you have a default key set in your code.
+    # For now, let's assume 'YOUR_API_KEY' is the placeholder if you forget to fill it.
+    pass
+
+if not os.path.exists(folder_path):
+    print(f"❌ ERROR: Path not found: {folder_path}")
+    exit()
+
+try:
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(MODEL_ID)
+    print("✅ Gemini Model configured.")
+except Exception as e:
+    print(f"❌ ERROR configuring Gemini Model: {e}")
+    exit()
+
+# --- PROMPT 1: FAST EXTRACTION ---
+EXTRACTION_PROMPT_TEMPLATE = """
+We are doing historical research as historians on references to the future in a collection of Dutch letters of the Rotterdam merchant Abraham De Bra who was active in the second half of the 17th century and is writing to his Antwerp colleague Henri-François Schilders.
+We are interested in the types of futures in this letter.
+
+Identify and extract every single segment of the text that refers to the future.
+Longer segments should be split into parts that belong together (for example an If, then sentence in the future should be split into the if and then part).
+Do not perform any analysis. Be as complete as possible and make sure not to miss any future statement.
+
+**IMPORTANT OUTPUT INSTRUCTION:**
+Please output ONLY a numbered list of the exact future statements found.
+Example format:
+1. "segment one"
+2. "segment two"
+3. "segment three"
+...
+If no future statements are found, output "NO_FUTURES_FOUND".
+
+- Letter text:
+"""
+
+# --- PROMPT 2: DETAILED ANALYSIS ---
+ANALYSIS_PROMPT_TEMPLATE = """
+We are doing historical research as historians on references to future in a collection of Dutch letters (Letter text:) of the Rotterdam merchant Abraham De Bra who was active in the second half of the 17th century and is writing to his Antwerp colleague Henri-François Schilders. We are interested in the types of futures in this letter.
+Your task is to analyze these statements and provide your results in a table form.
+- Column 1 called Future_statement: provide the segment of the text here.
+- Column 2 called Future_statement_explanation: say why you think this is about the future. There has to be an explanation. Also say explicitly what made you think this is about the future: grammar, certain keywords and/or indications of future time
+- Column 3 called Modality: Must be 'deontic' or 'epistemic'. We distinguish two main types of modality: epistemic and deontic modality. Epistemic modality concerns knowledge, belief and likelihood, in our case about the future. It is speculation about how sure the writer or some else is that something will or might happen. Deontic modality expresses what should happen, it is prescriptive. In this sense, it concerns duty, permission, commands, obligation on the one hand and hopes or fears on the other. Always give a value.
+- Column 4 called Modality_explanation: provide the explanation why it is deontic or epistemic. This cell cannot be empty.
+- Column 5 called Control: who is in control of this future? Who can affect the possible outcome? (writer, addressee, or third party; if third party, say which one).
+- Column 6 called Specific: Does this future statement contain a specific moment in the future? Must be 'Yes' or 'No'.
+- Column 7 called Specificmoment: if yes in column 6, which moment is that?
+- Column 8 called Specificmoment_explanation: explain decision from column 7 if column 6 is yes
+- Column 9 called Order: Is this future statement an order, a command from one merchant to another to do a certain action? Must be 'Yes' or 'No'.
+- Column 10 called Domain: Categorize the domain of the future statement (possible domains: family, religion, politics, finance, trade, transport, correspondence, court case, housing, reputation, accounting, agriculture, arrest of trader, disease, friendship, other - state type).
+- Column 11 called Word_count: count the number of words of the future statement.
+
+
+You should use the following five examples of successful identification and annotation for learning:
+Future Statement	Explanation	Modality	Modality Explanation	Control	Specific Moment	Specific Moment Explanation	Order	Domain	Word Count
+"Ick sall de naeste weeck occasie hebben om cost f 360 in circo hollants van weten remittere dat op ul sall passeren"	There is a reference to the next week and the writer uses the auxiliary verb sall or sullen twice. He intends to have 360 guilders and to transfer these by remittance to the addressee.	Deontic	It is the intention of the author to have the money ready. He desires it to be ready.	Writer	Yes	Naeste weeck (next week).	No	Finance	23
+"dat tot dese lage prijs groote consomtie vallen sall"	He writes that at this low price the consumption of wine will increase because he understands market dynamics. The use of the auxiliary verb sall indicates futurity.	Epistemic	It is based on his knowledge of the future.	Other (market)	No	No	No	Trade	9
+"in hoope van beter"	The writer has refused merchandise because he hopes the situation will improve.	Deontic	He hopes for a more desirable situation.	Other (none)	No	No	No	Trade	4
+"ick sall op morgen den brieff voornome van 10000 fweder naer dat sende"	The writer writes that he will send the aforementioned letter of 10,000 guilders tomorrow.	Deontic	It is a plan that he wants to execute.	Writer	Yes	Morgen (tomorrow).	No	Finance	14
+"ul vreest Op 20 deser niet hier sult wes"	The writer writes that the addressee fears that he will not be in Rotterdam on the 20th.	Deontic	The addressee wants to be in Rotterdam but he will not make it.	Addressee	Yes	op 20 (the 20th of that month).	No	Travel	9
+
+**IMPORTANT OUTPUT INSTRUCTION:**
+Please output ONLY the table in Markdown format. Do not add introductory or concluding text.
+
+- Statement(s) for analysis:
+"""
+
+# --- DATA STRUCTURE ---
+files = [f for f in os.listdir(folder_path) if f.endswith('.txt')]
+print(f"✅ Starting analysis of {len(files)} files...")
+
+all_data = []
+columns = [
+    "Filename", "Future_statement", "Future_statement_explanation", "Modality",
+    "Modality_explanation", "Control", "Specific", "Specificmoment",
+    "Specificmoment_explanation", "Order", "Domain", "Word_count"
+]
+
+# ==========================================
+# 4. PROCESSING LOOP
+# ==========================================
+pbar = tqdm(files, desc="Processing")
+
+for index, filename in enumerate(pbar):
+    pbar.set_description(f"File: {filename[:15]}...")
+    file_path = os.path.join(folder_path, filename)
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            letter_text = f.read()
+
+        # --- STEP 1: EXTRACTION (Fast Call) ---
+        extraction_prompt = EXTRACTION_PROMPT_TEMPLATE + f"\n[{letter_text}]"
+        extracted_statements = []
+        extraction_success = False
+
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                # Use API_TIMEOUT_SECONDS (180s) for robust extraction
+                extraction_response = model.generate_content(
+                    extraction_prompt,
+                    request_options={'timeout': API_TIMEOUT_SECONDS}
+                )
+
+                if extraction_response.text and "NO_FUTURES_FOUND" not in extraction_response.text:
+                    # Parse the numbered list output
+                    lines = extraction_response.text.strip().split('\n')
+                    for line in lines:
+                        if line.strip() and (any(char in line for char in '123456789.-')):
+                            # Use simple splitting to clean statement from list markers (e.g., "1. " or "- ")
+                            statement = line.split('.', 1)[-1].split('-', 1)[-1].strip().strip('"').strip("'")
+                            if statement:
+                                extracted_statements.append(statement)
+                    pbar.write(f"  -> Extracted {len(extracted_statements)} statements.")
+
+                extraction_success = True
+                break
+
+            except Exception as e:
+                pbar.write(f"❌ Extraction Error ({type(e).__name__}) on {filename}. Retrying in {DELAY_ON_ERROR}s...")
+                if attempt == RETRY_ATTEMPTS - 1:
+                    pbar.write(f"🛑 Extraction failed after {RETRY_ATTEMPTS} attempts. Skipping file.")
+                    break
+                time.sleep(DELAY_ON_ERROR)
+
+        if not extracted_statements:
+            time.sleep(DELAY_PER_FILE)
+            continue # Move to the next file if nothing was extracted
+
+        # --- STEP 2: ANALYSIS (Robust Call) ---
+        statements_for_analysis = "\n".join([f'- "{s}"' for s in extracted_statements])
+        analysis_prompt = ANALYSIS_PROMPT_TEMPLATE + f"\n{statements_for_analysis}"
+        response_text = None
+
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                # Use the maximum timeout (180s) for the complex analysis
+                response = model.generate_content(
+                    analysis_prompt,
+                    request_options={'timeout': API_TIMEOUT_SECONDS}
+                )
+                response_text = response.text
+                if not response_text.strip():
+                    raise InternalServerError("Received empty response from API.")
+                break # Success, exit retry loop
+
+            except (ResourceExhausted, InternalServerError, DeadlineExceeded, ReadTimeout) as e:
+                wait_time = DELAY_ON_ERROR * (attempt + 1)
+                pbar.write(f"❌ Analysis API Error ({type(e).__name__}) on {filename}. Retrying in {wait_time}s...")
+                if attempt == RETRY_ATTEMPTS - 1:
+                    pbar.write(f"🛑 Analysis failed for {filename} after {RETRY_ATTEMPTS} attempts. Skipping file.")
+                    response_text = "ERROR_TIMEOUT_OR_SERVER_ISSUE"
+                    break
+                time.sleep(wait_time)
+
+            except Exception as e:
+                pbar.write(f"❌ Unforeseen Error during analysis on {filename}: {e}. Skipping file.")
+                response_text = "ERROR_UNFORESEEN"
+                break
+
+        # --- PARSING AND SAVING ---
+        if response_text and response_text not in ["ERROR_TIMEOUT_OR_SERVER_ISSUE", "ERROR_UNFORESEEN"]:
+
+            if "NO_FUTURES_FOUND" not in response_text:
+                try:
+                    lines = response_text.strip().split('\n')
+                    table_lines = [line for line in lines if '|' in line]
+
+                    if len(table_lines) >= 2:
+                        clean_table = "\n".join(table_lines)
+                        df_temp = pd.read_csv(io.StringIO(clean_table), sep="|", skipinitialspace=True, engine='python', quoting=3)
+
+                        # Fix 1: Drop columns that are completely empty
+                        df_temp = df_temp.dropna(axis=1, how='all')
+
+                        # Fix 2: Drop columns that pandas automatically names "Unnamed" (fixes leading/trailing pipes)
+                        unnamed_cols = [col for col in df_temp.columns if 'Unnamed:' in str(col)]
+                        df_temp = df_temp.drop(columns=unnamed_cols, errors='ignore')
+
+                        # Fix 3: Remove the header divider row
+                        df_temp = df_temp.iloc[1:]
+
+                        # Fix 4: NOW check the column count
+                        if df_temp.shape[1] == 11:
+                            df_temp.columns = columns[1:]
+                            df_temp.insert(0, "Filename", filename)
+                            all_data.extend(df_temp.to_dict('records'))
+                            pbar.write(f"  -> Successfully analyzed and saved {len(df_temp)} rows.")
+                        else:
+                            pbar.write(f"❌ Parse Error {filename}: Column mismatch. Expected 11, got {df_temp.shape[1]}.")
+
+                except Exception as e:
+                    pbar.write(f"❌ Parse Error {filename}: {e}.")
+
+        # Auto-Save Checkpoint
+        if (index + 1) % 50 == 0 and all_data:
+            pd.DataFrame(all_data).to_excel(CHECKPOINT_FILE, index=False)
+            pbar.write(f"💾 Checkpoint saved ({len(all_data)} rows found so far)")
+
+        time.sleep(DELAY_PER_FILE)
+
+    except Exception as e:
+        pbar.write(f"❌ Outer Loop Error processing file {filename}: {e}")
+        time.sleep(DELAY_ON_ERROR)
+
+# Final Save
+if all_data:
+    pd.DataFrame(all_data).to_excel(FINAL_FILE, index=False)
+    print(f"\n✅ DONE! Saved {len(all_data)} rows to: {FINAL_FILE}")
+else:
+    print("\n✅ DONE! Processed all files, but no future statements were successfully extracted.")
